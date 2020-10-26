@@ -682,7 +682,7 @@ clean_up() { # Perform pre-exit housekeeping
       # shellcheck source=/dev/null
       . "$dnsfile"
       debug "attempting to clean up DNS entry for $d"
-      eval "$DNS_DEL_COMMAND" "$d" "$auth_key"
+      eval "$DNS_DEL_COMMAND" "${d##\*.}" "$auth_key"
     done
     shopt -u nullglob
   fi
@@ -895,7 +895,7 @@ create_order() {
     dn=0
     for d in $alldomains; do
       # get authorizations link
-      AuthLink[$dn]=$(json_get "$response" "identifiers" "value" "$d" "authorizations" "x")
+      AuthLink[$dn]=$(json_get "$response" "identifiers" "value" "${d##\*.}" "authorizations" "x")
       debug "authorizations link for $d - ${AuthLink[$dn]}"
       ((dn++))
     done
@@ -913,7 +913,7 @@ create_order() {
       dn=0
       for d in $alldomains; do
         # Convert domain to lowercase as response from server will be in lowercase
-        d=$(echo "$d" | tr "[:upper:]" "[:lower:]")
+        d=$(echo "${d##\*.}" | tr "[:upper:]" "[:lower:]")
         if [ "$d" == "$authdomain" ]; then
           debug "Saving authorization response for $authdomain for domain alldomains[$dn]"
           debug "Response = ${response//[$'\t\r\n']}"
@@ -1015,7 +1015,7 @@ for d in $alldomains; do
 
   # request a challenge token from ACME server
   if [[ $API -eq 1 ]]; then
-    request="{\"resource\":\"new-authz\",\"identifier\":{\"type\":\"dns\",\"value\":\"$d\"}}"
+    request="{\"resource\":\"new-authz\",\"identifier\":{\"type\":\"dns\",\"value\":\"${d##\*.}\"}}"
     send_signed_request "$URL_new_authz" "$request"
     debug "completed send_signed_request"
 
@@ -1068,7 +1068,7 @@ for d in $alldomains; do
       debug auth_key "$auth_key"
 
       # shellcheck disable=SC2018,SC2019
-      lower_d=$(echo "$d" | tr A-Z a-z)
+      lower_d=$(echo "${d##\*.}" | tr A-Z a-z)
       debug "adding dns via command: $DNS_ADD_COMMAND $lower_d $auth_key"
       if ! eval "$DNS_ADD_COMMAND" "$lower_d" "$auth_key" ; then
         error_exit "DNS_ADD_COMMAND failed for domain $d"
@@ -1191,7 +1191,7 @@ if [[ $VALIDATE_VIA_DNS == "true" ]]; then
 
       # Always use lowercase domain name when querying DNS servers
       # shellcheck disable=SC2018,SC2019
-      lower_d=$(echo "$d" | tr A-Z a-z)
+      lower_d=$(echo "${d##\*.}" | tr A-Z a-z)
 
       # check for token at public dns server, waiting for a valid response.
       for ns in $primary_ns; do
@@ -1265,7 +1265,7 @@ if [[ $VALIDATE_VIA_DNS == "true" ]]; then
 
       debug "remove DNS entry"
       # shellcheck disable=SC2018,SC2019
-      lower_d=$(echo "$d" | tr A-Z a-z)
+      lower_d=$(echo "${d##\*.}" | tr A-Z a-z)
       eval "$DNS_DEL_COMMAND" "$lower_d" "$auth_key"
       # remove $dnsfile after each loop.
       rm -f "$dnsfile"
@@ -2674,11 +2674,12 @@ fi
 
 # if check_remote is true then connect and obtain the current certificate (if not forcing renewal)
 if [[ "${CHECK_REMOTE}" == "true" ]] && [[ $_FORCE_RENEW -eq 0 ]]; then
-  debug "getting certificate for $DOMAIN from remote server"
+  real_d=${DOMAIN##\*.}
+  debug "getting certificate for $DOMAIN from remote server ($real_d)"
   if [[ "$DUAL_RSA_ECDSA" == "true" ]]; then
     # shellcheck disable=SC2086
     # check if openssl supports RSA-PSS
-    if [[ $(echo | openssl s_client -servername "${DOMAIN}" -connect "${DOMAIN}:${REMOTE_PORT}" ${REMOTE_EXTRA} -sigalgs RSA-PSS+SHA256 2>/dev/null) ]]; then
+    if [[ $(echo | openssl s_client -servername "${real_d}" -connect "${real_d}:${REMOTE_PORT}" ${REMOTE_EXTRA} -sigalgs RSA-PSS+SHA256 2>/dev/null) ]]; then
         CIPHER="-sigalgs RSA+SHA256:RSA+SHA384:RSA+SHA512:RSA-PSS+SHA256:RSA-PSS+SHA512"
     else
         CIPHER="-sigalgs RSA+SHA256:RSA+SHA384:RSA+SHA512"
@@ -2688,7 +2689,7 @@ if [[ "${CHECK_REMOTE}" == "true" ]] && [[ $_FORCE_RENEW -eq 0 ]]; then
   fi
   # shellcheck disable=SC2086
   EX_CERT=$(echo \
-    | openssl s_client -servername "${DOMAIN}" -connect "${DOMAIN}:${REMOTE_PORT}" ${REMOTE_EXTRA} ${CIPHER} 2>/dev/null \
+    | openssl s_client -servername "${real_d}" -connect "${real_d}:${REMOTE_PORT}" ${REMOTE_EXTRA} ${CIPHER} 2>/dev/null \
     | openssl x509 2>/dev/null)
   if [[ -n "$EX_CERT" ]]; then # if obtained a cert
     if [[ -s "$CERT_FILE" ]]; then # if local exists
@@ -2941,11 +2942,12 @@ fi
 
 # Check if the certificate is installed correctly
 if [[ ${CHECK_REMOTE} == "true" ]]; then
+  real_d=${DOMAIN##\*.}
   sleep "$CHECK_REMOTE_WAIT"
   if [[ "$DUAL_RSA_ECDSA" == "true" ]]; then
     # shellcheck disable=SC2086
     # check if openssl supports RSA-PSS
-    if [[ $(echo | openssl s_client -servername "${DOMAIN}" -connect "${DOMAIN}:${REMOTE_PORT}" ${REMOTE_EXTRA} -sigalgs RSA-PSS+SHA256 2>/dev/null) ]]; then
+    if [[ $(echo | openssl s_client -servername "${real_d}" -connect "${real_d}:${REMOTE_PORT}" ${REMOTE_EXTRA} -sigalgs RSA-PSS+SHA256 2>/dev/null) ]]; then
         PARAMS=("-sigalgs RSA-PSS+SHA256:RSA-PSS+SHA512:RSA+SHA256:RSA+SHA384:RSA+SHA512" "-sigalgs ECDSA+SHA256:ECDSA+SHA384:ECDSA+SHA512")
     else
         PARAMS=("-sigalgs RSA+SHA256:RSA+SHA384:RSA+SHA512" "-sigalgs ECDSA+SHA256:ECDSA+SHA384:ECDSA+SHA512")
@@ -2963,19 +2965,19 @@ if [[ ${CHECK_REMOTE} == "true" ]]; then
     debug "Checking ${CERTS[i]}"
     # shellcheck disable=SC2086
     CERT_REMOTE=$(echo \
-        | openssl s_client -servername "${DOMAIN}" -connect "${DOMAIN}:${REMOTE_PORT}" ${REMOTE_EXTRA} ${PARAMS[i]} 2>/dev/null \
+        | openssl s_client -servername "${real_d}" -connect "${real_d}:${REMOTE_PORT}" ${REMOTE_EXTRA} ${PARAMS[i]} 2>/dev/null \
         | openssl x509 -noout -fingerprint 2>/dev/null)
     CERT_LOCAL=$(openssl x509 -noout -fingerprint < "${CERTS[i]}" 2>/dev/null)
     debug CERT_LOCAL="${CERT_LOCAL}"
     debug CERT_REMOTE="${CERT_REMOTE}"
     if [[ "$CERT_LOCAL" == "$CERT_REMOTE" ]]; then
-        info "${DOMAIN} - ${TYPES[i]} certificate installed OK on server"
+        info "${real_d} - ${TYPES[i]} certificate installed OK on server"
     elif [[ "$CERT_REMOTE" == "" ]]; then
         info "${CERTS[i]} not returned by server"
-        error_exit "${DOMAIN} - ${TYPES[i]} certificate obtained but not installed on server"
+        error_exit "${real_d} - ${TYPES[i]} certificate obtained but not installed on server"
     else
         info "${CERTS[i]} didn't match server"
-        error_exit "${DOMAIN} - ${TYPES[i]} certificate obtained but certificate on server is different from the new certificate"
+        error_exit "${real_d} - ${TYPES[i]} certificate obtained but certificate on server is different from the new certificate"
     fi
   done
 fi
