@@ -10,9 +10,12 @@ setup() {
     export CURL_CA_BUNDLE=/root/pebble-ca-bundle.crt
 }
 
-# TODO test certificate on host doesn't need renewing
-# TODO test certificate on host does need renewing
 # TODO test certificate revoke
+# TODO test secp385
+# TODO test dual rsa
+# TODO test copy to multiple locations
+# TODO test items in SANS
+# TODO test domain with wildcard in SANS
 # TODO generate error if wildcard cert and http-01 verification
 
 
@@ -28,7 +31,46 @@ setup() {
     setup_environment
 
     init_getssl
-    create_certificate -d
+    create_certificate
     assert_success
     check_output_for_errors
+}
+
+
+@test "Check CHECK_REMOTE works for wildcard certificates" {
+    if [ -n "$STAGING" ]; then
+        skip "Not trying on staging server yet"
+    fi
+
+    run ${CODE_DIR}/getssl "*.$GETSSL_HOST"
+    assert_success
+    assert_line --partial "certificate is valid for more than"
+    check_output_for_errors
+}
+
+
+@test "Force renewal of wildcard certificate" {
+    if [ -n "$STAGING" ]; then
+        skip "Not trying on staging server yet"
+    fi
+
+    run ${CODE_DIR}/getssl -f "*.$GETSSL_HOST"
+    assert_success
+    refute_line --partial "certificate is valid for more than"
+    check_output_for_errors
+}
+
+
+@test "Check renewal of near-expiration wildcard certificate" {
+    if [ -n "$STAGING" ]; then
+        skip "Not trying on staging server yet"
+    fi
+
+    echo "RENEW_ALLOW=2000" >> "${INSTALL_DIR}/.getssl/*.${GETSSL_HOST}/getssl.cfg"
+
+    run ${CODE_DIR}/getssl "*.$GETSSL_HOST"
+    assert_success
+    refute_line --partial "certificate is valid for more than"
+    check_output_for_errors
+    cleanup_environment
 }
