@@ -518,13 +518,13 @@ check_config() { # check the config files for all obvious errors
     config_errors=true
   fi
 
-  # get all domains
+  # get all domains into an array
   if [[ "$IGNORE_DIRECTORY_DOMAIN" == "true" ]]; then
-    alldomains=${SANS//[, ]/ }
+    read -a alldomains <<< "${SANS//[, ]/ }"
   else
-    alldomains=$(echo "$DOMAIN,$SANS" | sed "s/,/ /g")
+    read -a alldomains <<< "$(echo "$DOMAIN,$SANS" | sed "s/,/ /g")"
   fi
-  if [[ -z "$alldomains" ]]; then
+  if [[ -z "${alldomains[*]}" ]]; then
     info "${DOMAIN}: no domains specified"
     config_errors=true
   fi
@@ -542,7 +542,7 @@ check_config() { # check the config files for all obvious errors
 
   dn=0
   tmplist=$(mktemp 2>/dev/null || mktemp -t getssl)
-  for d in $alldomains; do # loop over domains (dn is domain number)
+  for d in "${alldomains[@]}"; do # loop over domains (dn is domain number)
     debug "checking domain $d"
     if [[ "$(grep "^${d}$" "$tmplist")" = "$d" ]]; then
       info "${DOMAIN}: $d appears to be duplicated in domain, SAN list"
@@ -809,14 +809,14 @@ create_csr() { # create a csr using a given key (if it doesn't already exist)
     debug "domain csr exists at - $csr_file"
     # check all domains in config are in csr
     if [[ "$IGNORE_DIRECTORY_DOMAIN" == "true" ]]; then
-      alldomains=$(echo "$SANS" | sed -e 's/ //g; s/,$//; y/,/\n/' | sort -u)
+      read -a alldomains <<< "$(echo "$SANS" | sed -e 's/ //g; s/,$//; y/,/\n/' | sort -u)"
     else
-      alldomains=$(echo "$DOMAIN,$SANS" | sed -e 's/,/ /g; s/ $//; y/ /\n/' | sort -u)
+      read -a alldomains <<< "$(echo "$DOMAIN,$SANS" | sed -e 's/,/ /g; s/ $//; y/ /\n/' | sort -u)"
     fi
     domains_in_csr=$(openssl req -text -noout -in "$csr_file" \
         | sed -n -e 's/^ *Subject: .* CN=\([A-Za-z0-9.-]*\).*$/\1/p; /^ *DNS:.../ { s/ *DNS://g; y/,/\n/; p; }' \
         | sort -u)
-    for d in $alldomains; do
+    for d in "${alldomains[@]}"; do
       if [[ "$(echo "${domains_in_csr}"| grep "^${d}$")" != "${d}" ]]; then
         info "existing csr at $csr_file does not contain ${d} - re-create-csr"\
           ".... $(echo "${domains_in_csr}"| grep "^${d}$")"
@@ -824,7 +824,7 @@ create_csr() { # create a csr using a given key (if it doesn't already exist)
       fi
     done
     # check all domains in csr are in config
-    if [[ "$alldomains" != "$domains_in_csr" ]]; then
+    if [[ "${alldomains[*]}" != "$domains_in_csr" ]]; then
       info "existing csr at $csr_file does not have the same domains as the config - re-create-csr"
       _RECREATE_CSR=1
     fi
@@ -877,7 +877,7 @@ create_key() { # create a domain key (if it doesn't already exist)
 
 create_order() {
   dstring="["
-  for d in $alldomains; do
+  for d in "${alldomains[@]}"; do
     dstring="${dstring}{\"type\":\"dns\",\"value\":\"$d\"},"
   done
   dstring="${dstring::${#dstring}-1}]"
@@ -893,7 +893,7 @@ create_order() {
 
   if [[ $API -eq 1 ]]; then
     dn=0
-    for d in $alldomains; do
+    for d in "${alldomains[@]}"; do
       # get authorizations link
       AuthLink[$dn]=$(json_get "$response" "identifiers" "value" "${d##\*.}" "authorizations" "x")
       debug "authorizations link for $d - ${AuthLink[$dn]}"
@@ -911,7 +911,7 @@ create_order() {
       authdomain=$(json_get "$response" "identifier" "value")
       # find array position (This is O(n2) but that doubt we'll see performance issues)
       dn=0
-      for d in $alldomains; do
+      for d in "${alldomains[@]}"; do
         # Convert domain to lowercase as response from server will be in lowercase
         d=$(echo "${d##\*.}" | tr "[:upper:]" "[:lower:]")
         if [ "$d" == "$authdomain" ]; then
@@ -1004,7 +1004,7 @@ find_dns_utils() {
 
 fulfill_challenges() {
 dn=0
-for d in $alldomains; do
+for d in "${alldomains[@]}"; do
   # $d is domain in current loop, which is number $dn for ACL
   info "Verifying $d"
   if [[ "$USE_SINGLE_ACL" == "true" ]]; then
@@ -2589,14 +2589,15 @@ if [[ ${_CREATE_CONFIG} -eq 1 ]]; then
   else
     info "creating domain config file in $DOMAIN_DIR/getssl.cfg"
     # if domain has an existing cert, copy from domain and use to create defaults.
+    #!FIXME add wildcard test for this scenario
     EX_CERT=$(echo \
-      | openssl s_client -servername "${DOMAIN}" -connect "${DOMAIN}:443" 2>/dev/null \
+      | openssl s_client -servername "${DOMAIN##\*.}" -connect "${DOMAIN##\*.}:443" 2>/dev/null \
       | openssl x509 2>/dev/null)
-    EX_SANS="www.${DOMAIN}"
+    EX_SANS="www.${DOMAIN##\*.}"
     if [[ -n "${EX_CERT}" ]]; then
       EX_SANS=$(echo "$EX_CERT" \
         | openssl x509 -noout -text 2>/dev/null| grep "Subject Alternative Name" -A2 \
-        | grep -Eo "DNS:[a-zA-Z 0-9.-]*" | sed "s@DNS:$DOMAIN@@g" | grep -v '^$' | cut -c 5-)
+        | grep -Eo "DNS:[a-zA-Z 0-9.-]*" | sed "s@DNS:${DOMAIN##\*.}@@g" | grep -v '^$' | cut -c 5-)
       EX_SANS=${EX_SANS//$'\n'/','}
     fi
     write_domain_template "$DOMAIN_DIR/getssl.cfg"
@@ -2878,9 +2879,9 @@ info "Verify each domain"
 
 # loop through domains for cert ( from SANS list)
 if [[ "$IGNORE_DIRECTORY_DOMAIN" == "true" ]]; then
-  alldomains=${SANS//[, ]/ }
+  read -a alldomains <<< "${SANS//[, ]/ }"
 else
-  alldomains=$(echo "$DOMAIN,$SANS" | sed "s/,/ /g")
+  read -a alldomains <<< "$(echo "$DOMAIN,$SANS" | sed "s/,/ /g")"
 fi
 
 if [[ $API -eq 2 ]]; then
