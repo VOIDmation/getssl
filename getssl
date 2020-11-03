@@ -469,7 +469,7 @@ check_challenge_completion() { # checks with the ACME server if our challenge is
     # if ACME response is that their check gave an invalid response, error exit
     if [[ "$status" == "invalid" ]] ; then
       err_detail=$(echo "$response" | grep "detail")
-      #! FIXME need to check for "DNS problem: SERVFAIL looking up CAA ..." and retry
+      # TODO need to check for "DNS problem: SERVFAIL looking up CAA ..." and retry
       error_exit "$domain:Verify error:$err_detail"
     fi
 
@@ -490,6 +490,84 @@ check_challenge_completion() { # checks with the ACME server if our challenge is
     debug "adding url to deactivate list - $deactivate_url"
   fi
 }
+
+check_challenge_completion_dns() { # perform validation via DNS challenge
+  token=$1
+  uri=$2
+  keyauthorization=$3
+  d=$4
+  primary_ns=$5
+  auth_key=$6
+
+  # Always use lowercase domain name when querying DNS servers
+  # shellcheck disable=SC2018,SC2019
+  lower_d=$(echo "${d##\*.}" | tr A-Z a-z)
+
+  # check for token at public dns server, waiting for a valid response.
+  for ns in $primary_ns; do
+    debug "checking dns at $ns"
+    ntries=0
+    check_dns="fail"
+    while [[ "$check_dns" == "fail" ]]; do
+      if [[ "$os" == "cygwin" ]]; then
+        check_result=$(nslookup -type=txt "_acme-challenge.${lower_d}" "${ns}" \
+                      | grep ^_acme -A2\
+                      | grep '"'|awk -F'"' '{ print $2}')
+      elif [[ "$DNS_CHECK_FUNC" == "drill" ]] || [[ "$DNS_CHECK_FUNC" == "dig" ]]; then
+        debug "$DNS_CHECK_FUNC" TXT "_acme-challenge.${lower_d}" "@${ns}"
+        check_result=$($DNS_CHECK_FUNC TXT "_acme-challenge.${lower_d}" "@${ns}" \
+                      | grep -i "^_acme-challenge.${lower_d}" \
+                      | grep 'IN\WTXT'|awk -F'"' '{ print $2}')
+      elif [[ "$DNS_CHECK_FUNC" == "host" ]]; then
+        check_result=$($DNS_CHECK_FUNC -t TXT "_acme-challenge.${lower_d}" "${ns}" \
+                      | grep 'descriptive text'|awk -F'"' '{ print $2}')
+      else
+        check_result=$(nslookup -type=txt "_acme-challenge.${lower_d}" "${ns}" \
+                      | grep 'text ='|awk -F'"' '{ print $2}')
+      fi
+      debug "expecting  $auth_key"
+      debug "${ns} gave ... $check_result"
+
+      if [[ "$check_result" == *"$auth_key"* ]]; then
+        check_dns="success"
+      else
+        if [[ $ntries -lt $DNS_WAIT_COUNT ]]; then
+          ntries=$(( ntries + 1 ))
+
+          if [[ $DNS_WAIT_RETRY_ADD == "true" && $(( ntries % 10 )) == 0 ]]; then
+            debug "Retrying adding dns via command: $DNS_ADD_COMMAND $lower_d $auth_key"
+            eval "$DNS_DEL_COMMAND" "$lower_d" "$auth_key"
+            if ! eval "$DNS_ADD_COMMAND" "$lower_d" "$auth_key" ; then
+              error_exit "DNS_ADD_COMMAND failed for domain $d"
+            fi
+
+          fi
+          info "checking DNS at ${ns} for ${lower_d}. Attempt $ntries/${DNS_WAIT_COUNT} gave wrong result, "\
+            "waiting $DNS_WAIT secs before checking again"
+          sleep $DNS_WAIT
+        else
+          debug "dns check failed - removing existing value"
+          eval "$DNS_DEL_COMMAND" "$lower_d" "$auth_key"
+
+          error_exit "checking _acme-challenge.${lower_d} gave $check_result not $auth_key"
+        fi
+      fi
+    done
+  done
+
+  if [[ "$DNS_EXTRA_WAIT" -gt 0 && "$PREVIOUSLY_VALIDATED" != "true" ]]; then
+    info "sleeping $DNS_EXTRA_WAIT seconds before asking the ACME server to check the dns"
+    sleep "$DNS_EXTRA_WAIT"
+  fi
+
+  check_challenge_completion "$uri" "$d" "$keyauthorization"
+
+  debug "remove DNS entry"
+  # shellcheck disable=SC2018,SC2019
+  lower_d=$(echo "${d##\*.}" | tr A-Z a-z)
+  eval "$DNS_DEL_COMMAND" "$lower_d" "$auth_key"
+}
+# end of ... perform validation if via DNS challenge
 
 check_config() { # check the config files for all obvious errors
   debug "checking config"
@@ -909,12 +987,14 @@ create_order() {
       send_signed_request "$l" ""
       # Get domain from response
       authdomain=$(json_get "$response" "identifier" "value")
-      # find array position (This is O(n2) but that doubt we'll see performance issues)
+      wildcard=$(json_get "$response" "wildcard")
+      debug wildcard="$wildcard"
+      # find array position (This is O(n2) but doubt that we'll see performance issues)
       dn=0
       for d in "${alldomains[@]}"; do
         # Convert domain to lowercase as response from server will be in lowercase
-        d=$(echo "${d##\*.}" | tr "[:upper:]" "[:lower:]")
-        if [ "$d" == "$authdomain" ]; then
+        lower_d=$(echo "$d" | tr "[:upper:]" "[:lower:]")
+        if [[ ( "$lower_d" == "$authdomain" && -z "$wildcard" ) || ( "$lower_d" == "*.${authdomain}" && -n "$wildcard" ) ]]; then
           debug "Saving authorization response for $authdomain for domain alldomains[$dn]"
           debug "Response = ${response//[$'\t\r\n']}"
           AuthLinkResponse[$dn]=$response
@@ -1082,21 +1162,7 @@ for d in "${alldomains[@]}"; do
       fi
       debug primary_ns "$primary_ns"
 
-      # make a directory to hold pending dns-challenges
-      if [[ ! -d "$TEMP_DIR/dns_verify" ]]; then
-        mkdir "$TEMP_DIR/dns_verify"
-      fi
-
-      # generate a file with the current variables for the dns-challenge
-      cat > "$TEMP_DIR/dns_verify/$d" <<- _EOF_
-			token="${token}"
-			uri="${uri}"
-			keyauthorization="${keyauthorization}"
-			d="${d}"
-			primary_ns="${primary_ns}"
-			auth_key="${auth_key}"
-			_EOF_
-
+      check_challenge_completion_dns "${token}" "${uri}" "${keyauthorization}" "${d}" "${primary_ns}" "${auth_key}"
     else      # set up the correct http token for verification
       if [[ $API -eq 1 ]]; then
         # get the token from the http component
@@ -1179,101 +1245,7 @@ for d in "${alldomains[@]}"; do
     ((dn++))
   fi
 done # end of ... loop through domains for cert ( from SANS list)
-
-# perform validation if via DNS challenge
-if [[ $VALIDATE_VIA_DNS == "true" ]]; then
-  # loop through dns-variable files to check if dns has been changed
-  for dnsfile in "$TEMP_DIR"/dns_verify/*; do
-    if [[ -e "$dnsfile" ]]; then
-      debug "loading DNSfile: $dnsfile"
-      # shellcheck source=/dev/null
-      . "$dnsfile"
-
-      # Always use lowercase domain name when querying DNS servers
-      # shellcheck disable=SC2018,SC2019
-      lower_d=$(echo "${d##\*.}" | tr A-Z a-z)
-
-      # check for token at public dns server, waiting for a valid response.
-      for ns in $primary_ns; do
-        debug "checking dns at $ns"
-        ntries=0
-        check_dns="fail"
-        while [[ "$check_dns" == "fail" ]]; do
-          if [[ "$os" == "cygwin" ]]; then
-            check_result=$(nslookup -type=txt "_acme-challenge.${lower_d}" "${ns}" \
-                          | grep ^_acme -A2\
-                          | grep '"'|awk -F'"' '{ print $2}')
-          elif [[ "$DNS_CHECK_FUNC" == "drill" ]] || [[ "$DNS_CHECK_FUNC" == "dig" ]]; then
-            debug "$DNS_CHECK_FUNC" TXT "_acme-challenge.${lower_d}" "@${ns}"
-            check_result=$($DNS_CHECK_FUNC TXT "_acme-challenge.${lower_d}" "@${ns}" \
-                          | grep -i "^_acme-challenge.${lower_d}" \
-                          | grep 'IN\WTXT'|awk -F'"' '{ print $2}')
-          elif [[ "$DNS_CHECK_FUNC" == "host" ]]; then
-            check_result=$($DNS_CHECK_FUNC -t TXT "_acme-challenge.${lower_d}" "${ns}" \
-                          | grep 'descriptive text'|awk -F'"' '{ print $2}')
-          else
-            check_result=$(nslookup -type=txt "_acme-challenge.${lower_d}" "${ns}" \
-                          | grep 'text ='|awk -F'"' '{ print $2}')
-          fi
-          debug "expecting  $auth_key"
-          debug "${ns} gave ... $check_result"
-
-          if [[ "$check_result" == *"$auth_key"* ]]; then
-            check_dns="success"
-          else
-            if [[ $ntries -lt $DNS_WAIT_COUNT ]]; then
-              ntries=$(( ntries + 1 ))
-
-              if [[ $DNS_WAIT_RETRY_ADD == "true" && $(( ntries % 10 )) == 0 ]]; then
-                debug "Retrying adding dns via command: $DNS_ADD_COMMAND $lower_d $auth_key"
-                eval "$DNS_DEL_COMMAND" "$lower_d" "$auth_key"
-                if ! eval "$DNS_ADD_COMMAND" "$lower_d" "$auth_key" ; then
-                  error_exit "DNS_ADD_COMMAND failed for domain $d"
-                fi
-
-              fi
-              info "checking DNS at ${ns} for ${lower_d}. Attempt $ntries/${DNS_WAIT_COUNT} gave wrong result, "\
-                "waiting $DNS_WAIT secs before checking again"
-              sleep $DNS_WAIT
-            else
-              debug "dns check failed - removing existing value"
-              eval "$DNS_DEL_COMMAND" "$lower_d" "$auth_key"
-              # remove $dnsfile after each loop.
-              rm -f "$dnsfile"
-
-              error_exit "checking _acme-challenge.${lower_d} gave $check_result not $auth_key"
-            fi
-          fi
-        done
-      done
-    fi
-  done
-
-  if [[ "$DNS_EXTRA_WAIT" -gt 0 && "$PREVIOUSLY_VALIDATED" != "true" ]]; then
-    info "sleeping $DNS_EXTRA_WAIT seconds before asking the ACME server to check the dns"
-    sleep "$DNS_EXTRA_WAIT"
-  fi
-
-  # loop through dns-variable files to let the ACME server check the challenges
-  for dnsfile in "$TEMP_DIR"/dns_verify/*; do
-    if [[ -e "$dnsfile" ]]; then
-      debug "loading DNSfile: $dnsfile"
-      # shellcheck source=/dev/null
-      . "$dnsfile"
-
-      check_challenge_completion "$uri" "$d" "$keyauthorization"
-
-      debug "remove DNS entry"
-      # shellcheck disable=SC2018,SC2019
-      lower_d=$(echo "${d##\*.}" | tr A-Z a-z)
-      eval "$DNS_DEL_COMMAND" "$lower_d" "$auth_key"
-      # remove $dnsfile after each loop.
-      rm -f "$dnsfile"
-    fi
-  done
-fi
-# end of ... perform validation if via DNS challenge
-#end of varify each domain.
+#end of verify each domain.
 }
 
 get_auth_dns() { # get the authoritative dns server for a domain (sets primary_ns )
@@ -2589,7 +2561,7 @@ if [[ ${_CREATE_CONFIG} -eq 1 ]]; then
   else
     info "creating domain config file in $DOMAIN_DIR/getssl.cfg"
     # if domain has an existing cert, copy from domain and use to create defaults.
-    #!FIXME add wildcard test for this scenario
+    # TODO add wildcard test for this scenario
     EX_CERT=$(echo \
       | openssl s_client -servername "${DOMAIN##\*.}" -connect "${DOMAIN##\*.}:443" 2>/dev/null \
       | openssl x509 2>/dev/null)
